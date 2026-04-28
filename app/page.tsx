@@ -1,13 +1,14 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
 import JSZip from "jszip";
 import Image from "next/image";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const SEEK_VALUES = [-10, -5, -2, -1, 1, 2, 5, 10];
 type MediaType = "mp4" | "webm" | "webp";
-type ZipItemType = MediaType | "html";
+type ZipItemType = MediaType | "html" | "md";
 
 type ZipMediaItem = {
   id: string;
@@ -93,8 +94,40 @@ function getDisplayFileName(fileName: string, testId: string): string {
   return withIdRemoved.replace(/^[\s._-]+/, "").trim() || fileName;
 }
 
+function getBaseName(filePath: string): string {
+  const parts = filePath.split("/");
+  return (parts[parts.length - 1] ?? filePath).toLowerCase();
+}
+
+function getItemOrder(item: ZipMediaItem): number {
+  const baseName = getBaseName(item.name);
+  if (baseName === "playwright-report-index.html" || baseName === "playwright-report-index.htm") {
+    return 0;
+  }
+  if (baseName === "test-run-preview.html" || baseName === "test-run-preview.htm") {
+    return 1;
+  }
+  if (baseName === "testcases.md") {
+    return 2;
+  }
+  return 3;
+}
+
+function getReviewTitle(item: ZipMediaItem): string {
+  const baseName = getBaseName(item.name);
+  if (baseName === "playwright-report-index.html" || baseName === "playwright-report-index.htm") {
+    return "Test Run Summary";
+  }
+  if (baseName === "test-run-preview.html" || baseName === "test-run-preview.htm") {
+    return "Test Run Preview";
+  }
+  if (baseName === "testcases.md") {
+    return "Testcases";
+  }
+  return item.type === "html" || item.type === "md" ? "Test Run Report" : item.name;
+}
+
 function VideoReviewPage() {
-  const searchParams = useSearchParams();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -112,23 +145,15 @@ function VideoReviewPage() {
   const [zipFileName, setZipFileName] = useState<string | null>(null);
   const [zipItems, setZipItems] = useState<ZipMediaItem[]>([]);
   const [selectedZipId, setSelectedZipId] = useState<string | null>(null);
-  const [layoutMode, setLayoutMode] = useState<"split" | "stacked">("split");
+  const [layoutMode] = useState<"split" | "stacked">("split");
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  const videoUrl = searchParams.get("video")?.trim() ?? "";
   const selectedZipItem = zipItems.find((item) => item.id === selectedZipId) ?? null;
-  const currentMediaUrl = selectedZipItem?.url ?? videoUrl;
-  const currentMediaType: ZipItemType | null = selectedZipItem?.type
-    ?? (videoUrl.toLowerCase().endsWith(".webp")
-      ? "webp"
-      : videoUrl.toLowerCase().endsWith(".html") || videoUrl.toLowerCase().endsWith(".htm")
-        ? "html"
-      : videoUrl.toLowerCase().endsWith(".webm")
-        ? "webm"
-        : videoUrl
-          ? "mp4"
-          : null);
+  const currentMediaUrl = selectedZipItem?.url ?? "";
+  const currentMediaType: ZipItemType | null = selectedZipItem?.type ?? null;
   const isHtmlMode = currentMediaType === "html";
+  const isMarkdownMode = currentMediaType === "md";
+  const isDocumentMode = isHtmlMode || isMarkdownMode;
   const isVideoMode = currentMediaType === "mp4" || currentMediaType === "webm";
   const currentVideoMimeType = isVideoMode && currentMediaType ? getMimeType(currentMediaType) : undefined;
 
@@ -196,7 +221,7 @@ function VideoReviewPage() {
       try {
         await videoElement.play();
       } catch {
-        setCaptureMessage("Unable to play video. Check the URL or browser autoplay policy.");
+        setCaptureMessage("Unable to play video. Check the file format or browser autoplay policy.");
       }
       return;
     }
@@ -276,20 +301,22 @@ function VideoReviewPage() {
             ? "webp"
             : lowerName.endsWith(".html") || lowerName.endsWith(".htm")
               ? "html"
+            : lowerName.endsWith(".md")
+              ? "md"
             : null;
 
         if (!type) {
           continue;
         }
 
-        if (type === "html") {
-          const htmlContent = await entry.async("string");
+        if (type === "html" || type === "md") {
+          const textContent = await entry.async("string");
           items.push({
             id: `${entry.name}-${items.length}`,
             name: entry.name,
             type,
             url: "",
-            htmlContent,
+            htmlContent: textContent,
           });
         } else {
           const blob = await entry.async("blob");
@@ -310,21 +337,19 @@ function VideoReviewPage() {
         setZipItems([]);
         setSelectedZipId(null);
         setZipFileName(file.name);
-        setZipError("No .mp4/.webm/.webp/.html files found in ZIP.");
+        setZipError("No .mp4/.webm/.webp/.html/.md files found in ZIP.");
         return;
       }
 
       const sortedItems = [...items].sort((a, b) => {
-        if (a.type === "html" && b.type !== "html") {
-          return -1;
-        }
-        if (a.type !== "html" && b.type === "html") {
-          return 1;
+        const orderDiff = getItemOrder(a) - getItemOrder(b);
+        if (orderDiff !== 0) {
+          return orderDiff;
         }
         return a.name.localeCompare(b.name);
       });
 
-      const firstHtml = sortedItems.find((item) => item.type === "html");
+      const firstHtml = sortedItems.find((item) => item.type === "html" || item.type === "md");
       setZipItems(sortedItems);
       setSelectedZipId(firstHtml ? firstHtml.id : sortedItems[0].id);
       setZipFileName(file.name);
@@ -450,37 +475,12 @@ function VideoReviewPage() {
   }, []);
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="mx-auto flex w-full flex-col gap-8 px-8 py-8">
-        <h1 className="text-2xl font-semibold">Video Review Tool</h1>
-
-        <div className={`grid gap-8 ${layoutMode === "split" ? "md:grid-cols-[420px_1fr]" : "grid-cols-1"}`}>
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900 p-5">
-          <div className="flex items-start justify-between gap-3">
-            <p className="text-sm text-zinc-300">
-              Review using querystring:
-              {" "}
-              <code className="rounded bg-zinc-800 px-2 py-1">?video=https://example.com/video.mp4</code>
-            </p>
-            <button
-              type="button"
-              onClick={() => setLayoutMode((prev) => (prev === "split" ? "stacked" : "split"))}
-              aria-label={layoutMode === "split" ? "Switch to top and bottom layout" : "Switch to left and right layout"}
-              title={layoutMode === "split" ? "Top / Bottom" : "Left / Right"}
-              className="shrink-0 rounded-lg bg-zinc-800 px-3 py-2 text-zinc-100 hover:bg-zinc-700"
-            >
-              {layoutMode === "split" ? (
-                <span className="inline-flex flex-col items-center gap-1">
-                  <span className="h-1.5 w-4 rounded-sm border border-current" />
-                  <span className="h-1.5 w-4 rounded-sm border border-current" />
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1">
-                  <span className="h-3 w-2 rounded-sm border border-current" />
-                  <span className="h-3 w-2 rounded-sm border border-current" />
-                </span>
-              )}
-            </button>
+    <main className="h-dvh overflow-hidden bg-zinc-950 text-zinc-100">
+      <div className="mx-auto flex h-full w-full flex-col gap-4 px-3 py-3 md:gap-4 md:px-4 md:py-4 xl:px-5">
+        <div className={`grid min-h-0 flex-1 gap-4 ${layoutMode === "split" ? "md:grid-cols-[360px_1fr]" : "grid-cols-1"}`}>
+          <div className="flex min-h-0 flex-col overflow-y-auto rounded-2xl border border-zinc-800 bg-zinc-900 p-4">
+          <div className="flex items-start gap-3">
+            <p className="text-sm text-zinc-300">Upload a ZIP file to start reviewing media.</p>
           </div>
 
             <div className="mt-3 flex flex-col gap-2">
@@ -514,12 +514,12 @@ function VideoReviewPage() {
             {zipError ? <p className="mt-2 text-sm text-amber-300">{zipError}</p> : null}
 
             {zipItems.length > 0 ? (
-              <div className="mt-3 flex flex-col gap-2">
+              <div className="mt-3 flex min-h-0 flex-1 flex-col gap-2">
                 <div className="flex items-center justify-between gap-2">
                   <p className="text-sm text-zinc-200">Files in ZIP:</p>
                 </div>
                 {layoutMode === "split" ? (
-                  <div className="max-h-[520px] overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-950 p-3">
+                  <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-950 p-3">
                     <div className="flex flex-col gap-2">
                       {zipItems.map((item, index) => {
                         const meta = parseItemMeta(item.name);
@@ -539,7 +539,7 @@ function VideoReviewPage() {
                             }}
                             className="rounded-lg border px-4 py-3 text-left transition"
                           >
-                            {item.type !== "html" ? (
+                            {item.type !== "html" && item.type !== "md" ? (
                               <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide">
                                 <span className="rounded px-2 py-0.5 font-semibold" style={{ color: palette.accent, backgroundColor: "rgba(255,255,255,0.06)" }}>
                                   ID: {meta.testId}
@@ -549,10 +549,12 @@ function VideoReviewPage() {
                                 </span>
                               </div>
                             ) : null}
-                            {item.type === "html" ? (
+                            {item.type === "html" || item.type === "md" ? (
                               <p className="mt-2 text-sm text-zinc-100">
-                                <span className="block font-medium">Test Run Report</span>
-                                <span className="block truncate text-zinc-300">{item.name}</span>
+                                <span className={`block text-base font-bold tracking-tight ${item.type === "html" ? "text-sky-200" : "text-emerald-200"}`}>
+                                  {getReviewTitle(item)}
+                                </span>
+                                <span className="block truncate text-xs text-zinc-400">{item.name}</span>
                               </p>
                             ) : (
                               <p className="mt-2 truncate text-sm text-zinc-100">{getDisplayFileName(item.name, meta.testId)}</p>
@@ -583,7 +585,7 @@ function VideoReviewPage() {
                             }}
                             className="rounded-lg border px-4 py-3 text-left transition"
                           >
-                            {item.type !== "html" ? (
+                            {item.type !== "html" && item.type !== "md" ? (
                               <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide">
                                 <span className="rounded px-2 py-0.5 font-semibold" style={{ color: palette.accent, backgroundColor: "rgba(255,255,255,0.06)" }}>
                                   ID: {meta.testId}
@@ -593,10 +595,12 @@ function VideoReviewPage() {
                                 </span>
                               </div>
                             ) : null}
-                            {item.type === "html" ? (
+                            {item.type === "html" || item.type === "md" ? (
                               <p className="mt-2 w-56 text-sm text-zinc-100">
-                                <span className="block font-medium">Test Run Report</span>
-                                <span className="block truncate text-zinc-300">{item.name}</span>
+                                <span className={`block text-base font-bold tracking-tight ${item.type === "html" ? "text-sky-200" : "text-emerald-200"}`}>
+                                  {getReviewTitle(item)}
+                                </span>
+                                <span className="block truncate text-xs text-zinc-400">{item.name}</span>
                               </p>
                             ) : (
                               <p className="mt-2 w-56 truncate text-sm text-zinc-100">{getDisplayFileName(item.name, meta.testId)}</p>
@@ -607,39 +611,36 @@ function VideoReviewPage() {
                     </div>
                   </div>
                 )}
-                <p className="text-xs text-zinc-400">When ZIP is selected, ZIP files take priority over querystring media.</p>
+                <p className="text-xs text-zinc-400">ZIP supports `.mp4`, `.webm`, `.webp`, and `.html` files.</p>
               </div>
             ) : null}
           </div>
 
-          <div className="flex flex-col gap-6">
-            <div className="overflow-hidden rounded-2xl border border-zinc-800 bg-black">
+          <div className="flex min-h-0 flex-col gap-4">
+            <div className="min-h-0 flex-1 overflow-hidden rounded-2xl border border-zinc-800 bg-black">
               {selectedZipItem && isHtmlMode ? (
-                <div className="grid gap-0 md:grid-cols-[1.5fr_1fr]">
-                  <div className="min-h-[520px] border-b border-zinc-800 md:border-b-0 md:border-r">
-                    <div className="border-b border-zinc-800 bg-zinc-900 px-4 py-2 text-xs uppercase tracking-wide text-zinc-300">
-                      HTML Preview
-                    </div>
-                    <iframe
-                      ref={iframeRef}
-                      title={`html-preview-${selectedZipItem.name}`}
-                      srcDoc={selectedZipItem.htmlContent ?? ""}
-                      sandbox="allow-scripts allow-same-origin allow-forms"
-                      className="h-[470px] w-full bg-white"
-                    />
+                <div className="flex h-full min-h-[520px] flex-col">
+                  <div className="border-b border-zinc-800 bg-zinc-900 px-4 py-2 text-xs uppercase tracking-wide text-zinc-300">
+                    HTML Preview
                   </div>
-                  <div className="min-h-[520px] bg-zinc-950">
-                    <div className="border-b border-zinc-800 bg-zinc-900 px-4 py-2 text-xs uppercase tracking-wide text-zinc-300">
-                      HTML Review
-                    </div>
-                    <div className="space-y-3 p-4 text-sm text-zinc-200">
-                      <p><span className="text-zinc-400">File:</span> {selectedZipItem.name}</p>
-                      <p className="text-zinc-400">
-                        This is HTML review mode. You can inspect rendered layout in the left iframe.
-                      </p>
-                      <p className="text-zinc-400">
-                        Note: if HTML depends on relative assets (css/js/image) inside ZIP, `srcDoc` may not resolve all assets.
-                      </p>
+                  <iframe
+                    ref={iframeRef}
+                    title={`html-preview-${selectedZipItem.name}`}
+                    srcDoc={selectedZipItem.htmlContent ?? ""}
+                    sandbox="allow-scripts allow-same-origin allow-forms"
+                    className="h-full w-full flex-1 bg-white"
+                  />
+                </div>
+              ) : selectedZipItem && isMarkdownMode ? (
+                <div className="flex h-full min-h-[520px] flex-col">
+                  <div className="border-b border-zinc-800 bg-zinc-900 px-4 py-2 text-xs uppercase tracking-wide text-zinc-300">
+                    Markdown Preview
+                  </div>
+                  <div className="h-full flex-1 overflow-auto p-4 text-sm text-zinc-200">
+                    <div className="space-y-4 [&_a]:text-cyan-300 [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-zinc-700 [&_blockquote]:pl-3 [&_code]:rounded [&_code]:bg-zinc-800 [&_code]:px-1.5 [&_code]:py-0.5 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:text-lg [&_h3]:font-semibold [&_hr]:border-zinc-700 [&_li]:ml-5 [&_ol]:list-decimal [&_pre]:overflow-auto [&_pre]:rounded-lg [&_pre]:bg-zinc-900 [&_pre]:p-3 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-zinc-700 [&_td]:px-3 [&_td]:py-2 [&_th]:border [&_th]:border-zinc-700 [&_th]:bg-zinc-900 [&_th]:px-3 [&_th]:py-2 [&_ul]:list-disc">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {selectedZipItem.htmlContent ?? ""}
+                      </ReactMarkdown>
                     </div>
                   </div>
                 </div>
@@ -673,16 +674,12 @@ function VideoReviewPage() {
                 />
               ) : (
                 <div className="flex h-[420px] items-center justify-center px-6 text-center text-zinc-300">
-                  No media selected. Add
-                  {" "}
-                  <code className="mx-1 rounded bg-zinc-800 px-2 py-1">?video=...</code>
-                  {" "}
-                  or upload a ZIP file to review.
+                  No media selected. Upload a ZIP file to review.
                 </div>
               )}
             </div>
 
-            {!isHtmlMode ? (
+            {!isDocumentMode ? (
               <div className="rounded-2xl border border-zinc-800 bg-zinc-900 p-4">
             <div
               ref={sliderRef}
@@ -783,7 +780,7 @@ export default function Home() {
       fallback={
         <main className="min-h-screen bg-zinc-950 text-zinc-100">
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8">
-            <h1 className="text-2xl font-semibold">Video Review Tool</h1>
+            <h1 className="text-2xl font-semibold">E2E Review</h1>
             <p className="text-sm text-zinc-300">Loading interface...</p>
           </div>
         </main>
